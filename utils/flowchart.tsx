@@ -1,279 +1,118 @@
-import { unified } from 'unified';
-import remarkParse from 'remark-parse';
-import remarkStringify from 'remark-stringify';
-import { visit } from 'unist-util-visit';
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import { visit } from "unist-util-visit";
 
 type FlowchartNode = {
   id: string;
   label: string;
-  type: 'component' | 'process' | 'decision' | 'start' | 'end' | 'phase' | 'step';
-  children?: string[];
-  emoji?: string;
-  completed?: boolean;
+  type: "start" | "process" | "decision" | "end";
+  summary?: string; // Add summary field to store additional text
 };
 
 type FlowchartEdge = {
   from: string;
   to: string;
-  label?: string;
 };
 
 type FlowchartData = {
   nodes: FlowchartNode[];
   edges: FlowchartEdge[];
+  summary: string; // Store the original summary
 };
 
 /**
- * Extract headings, structure, and checkmarks from markdown content
+ * Extract headings and structure from markdown content
  */
 const extractStructure = (markdown: string) => {
   const processor = unified().use(remarkParse);
   const tree = processor.parse(markdown);
-  
-  const headings: { depth: number; text: string; id: string; emoji?: string }[] = [];
-  const codeBlocks: { lang: string; value: string; id: string }[] = [];
-  const listItems: { text: string; id: string; completed: boolean; parent?: string }[] = [];
-  
-  let currentHeadingId = '';
-  
-  visit(tree, 'heading', (node: any) => {
-    let text = '';
-    let emoji = '';
-    
-    // Extract text and emoji if present
-    node.children.forEach((child: any) => {
-      if (child.type === 'text') {
-        text += child.value;
-      } else if (child.type === 'emphasis' || child.type === 'strong') {
-        const innerText = child.children.map((c: any) => c.value).join('');
-        text += innerText;
-      } else if (child.type === 'inlineCode') {
-        text += child.value;
-      }
-    });
-    
-    // Check for emoji (simple pattern matching for common project emojis)
-    const emojiMatch = text.match(/([\u{1F300}-\u{1F6FF}]|[\u{2700}-\u{27BF}])/u);
-    if (emojiMatch) {
-      emoji = emojiMatch[0];
-      text = text.replace(emojiMatch[0], '').trim();
-    }
-    
+
+  const headings: { depth: number; text: string; id: string }[] = [];
+
+  visit(tree, "heading", (node: any) => {
+    const text = node.children
+      .filter((child: any) => child.type === "text")
+      .map((child: any) => child.value)
+      .join("");
+
     const id = `heading-${headings.length + 1}`;
-    headings.push({ depth: node.depth, text, id, emoji });
-    currentHeadingId = id;
+    headings.push({ depth: node.depth, text, id });
   });
-  
-  visit(tree, 'code', (node: any) => {
-    const id = `code-${codeBlocks.length + 1}`;
-    codeBlocks.push({ 
-      lang: node.lang || 'text', 
-      value: node.value, 
-      id 
-    });
-  });
-  
-  // Extract list items and check for checkmarks
-  visit(tree, 'listItem', (node: any, index, parent: any) => {
-    const id = `list-${listItems.length + 1}`;
-    let text = '';
-    let completed = false;
-    
-    // Check for checkmark syntax (✅ or - [x])
-    if (node.children[0] && node.children[0].type === 'paragraph') {
-      const paragraphNode = node.children[0];
+
+  // If no headings found, try to extract paragraphs or key sentences
+  if (headings.length === 0) {
+    let paragraphs: string[] = [];
+    visit(tree, "paragraph", (node: any) => {
+      const text = node.children
+        .filter((child: any) => child.type === "text")
+        .map((child: any) => child.value)
+        .join("");
       
-      // Extract complete text
-      text = paragraphNode.children
-        .map((child: any) => {
-          if (child.type === 'text') return child.value;
-          if (child.type === 'emphasis' || child.type === 'strong') {
-            return child.children.map((c: any) => c.value).join('');
-          }
-          return '';
-        })
-        .join('');
-      
-      // Check for completion indicators
-      if (text.includes('✅') || text.includes('[x]') || text.includes('[X]')) {
-        completed = true;
-        text = text.replace(/✅|\[x\]|\[X\]/g, '').trim();
-      }
-    }
-    
-    listItems.push({ 
-      text, 
-      id, 
-      completed, 
-      parent: currentHeadingId 
+      paragraphs.push(text);
     });
-  });
-  
-  return { headings, codeBlocks, listItems };
+
+    // Create artificial headings from paragraphs
+    paragraphs.forEach((text, index) => {
+      // Limit text length for labels
+      const label = text.length > 50 ? text.substring(0, 47) + "..." : text;
+      const id = `paragraph-${index + 1}`;
+      headings.push({ depth: 2, text: label, id });
+    });
+  }
+
+  return { headings };
 };
 
 /**
- * Generate structured flowchart data from markdown
+ * Generate flowchart data from markdown structure
  */
-const generateBasicFlowchart = (structure: ReturnType<typeof extractStructure>): FlowchartData => {
-  const { headings, codeBlocks, listItems } = structure;
+export const generateFlowchart = (markdown: string): FlowchartData => {
+  const { headings } = extractStructure(markdown);
+
   const nodes: FlowchartNode[] = [];
   const edges: FlowchartEdge[] = [];
-  
-  // Create start node
-  nodes.push({
-    id: 'start',
-    label: 'Start',
-    type: 'start'
-  });
-  
-  // Generate nodes from headings
-  let previousNodeId = 'start';
-  let lastNodesByLevel: Record<number, string> = {};
-  let phaseNodes: string[] = [];
-  
-  headings.forEach(heading => {
-    // Determine node type based on content and depth
-    let nodeType: FlowchartNode['type'] = 'process';
-    
-    if (heading.depth === 1) {
-      nodeType = 'component';
-    } else if (heading.depth === 2 && 
-              (heading.text.toLowerCase().includes('phase') || 
-               heading.text.includes('roadmap'))) {
-      nodeType = 'phase';
-    } else if (heading.text.toLowerCase().includes('step')) {
-      nodeType = 'step';
-    }
-    
+
+  // Add start node
+  nodes.push({ id: "start", label: "Start", type: "start" });
+
+  // Keep track of the last node at each depth level
+  const lastNodeByDepth: Record<number, string> = {};
+  lastNodeByDepth[0] = "start";
+
+  // Process headings to create a hierarchical structure
+  headings.forEach((heading) => {
     const node: FlowchartNode = {
       id: heading.id,
       label: heading.text,
-      type: nodeType,
-      emoji: heading.emoji
+      type: heading.depth === 1 ? "process" : "process", // Could use different types based on depth
     };
-    
-    nodes.push(node);
-    
-    // Track phase nodes
-    if (nodeType === 'phase') {
-      phaseNodes.push(heading.id);
-    }
-    
-    // Connect to parent heading or previous sibling
-    if (heading.depth > 1 && lastNodesByLevel[heading.depth - 1]) {
-      edges.push({
-        from: lastNodesByLevel[heading.depth - 1],
-        to: heading.id
-      });
-    } else if (heading.depth === 2) { // Connect major sections to start
-      edges.push({
-        from: 'start',
-        to: heading.id
-      });
-    } else {
-      edges.push({
-        from: previousNodeId,
-        to: heading.id
-      });
-    }
-    
-    previousNodeId = heading.id;
-    lastNodesByLevel[heading.depth] = heading.id;
-  });
-  
-  // Add list items as step nodes if they're important enough
-  listItems.forEach((item) => {
-    if (item.text.length > 10 && item.parent) { // Only add meaningful list items
-      const node: FlowchartNode = {
-        id: item.id,
-        label: item.text,
-        type: 'step',
-        completed: item.completed
-      };
-      
-      nodes.push(node);
-      
-      edges.push({
-        from: item.parent,
-        to: item.id
-      });
-    }
-  });
-  
-  // Add code blocks as decision nodes
-  codeBlocks.forEach((codeBlock, index) => {
-    const node: FlowchartNode = {
-      id: codeBlock.id,
-      label: `Code (${codeBlock.lang})`,
-      type: 'decision'
-    };
-    
-    nodes.push(node);
-    
-    if (index === 0 && headings.length === 0) {
-      edges.push({
-        from: 'start',
-        to: codeBlock.id
-      });
-    } else if (headings.length > 0) {
-      // Connect to the nearest preceding heading
-      edges.push({
-        from: previousNodeId,
-        to: codeBlock.id
-      });
-    }
-    
-    previousNodeId = codeBlock.id;
-  });
-  
-  // Create end node
-  nodes.push({
-    id: 'end',
-    label: 'End',
-    type: 'end'
-  });
-  
-  // Connect phases to end
-  if (phaseNodes.length > 0) {
-    phaseNodes.forEach(phaseId => {
-      edges.push({
-        from: phaseId,
-        to: 'end'
-      });
-    });
-  } else {
-    // Connect last node to end
-    edges.push({
-      from: previousNodeId,
-      to: 'end'
-    });
-  }
-  
-  return { nodes, edges };
-};
 
-/**
- * Main function to generate flowchart data from README content
- */
-export const generateFlowchart = (readmeContent: string): FlowchartData => {
-  // Extract structure from markdown
-  const structure = extractStructure(readmeContent);
-  
-  // Generate structured flowchart
-  const flowchartData = generateBasicFlowchart(structure);
-  
-  return flowchartData;
-};
+    nodes.push(node);
 
-/**
- * Enhance flowchart data using LLM API
- */
-export const enhanceFlowchartWithAI = async (
-  readmeContent: string,
-  flowchartData: FlowchartData
-): Promise<FlowchartData> => {
-  // This would be implemented to call the Groq API with models like qwen 2.5 or deepsekk
-  // For now, just return the existing data
-  return flowchartData;
+    // Connect to parent or previous sibling
+    const parentDepth = heading.depth - 1;
+    const parentId = lastNodeByDepth[parentDepth] || lastNodeByDepth[parentDepth - 1] || "start";
+    
+    edges.push({ from: parentId, to: heading.id });
+    
+    // Update last node at this depth
+    lastNodeByDepth[heading.depth] = heading.id;
+    
+    // Remove any deeper level references when we move to a new branch
+    for (let i = heading.depth + 1; i <= 6; i++) {
+      delete lastNodeByDepth[i];
+    }
+  });
+
+  // Add end node - connect to the last node at the lowest depth
+  nodes.push({ id: "end", label: "End", type: "end" });
+  
+  const lastNode = Object.values(lastNodeByDepth).pop() || "start";
+  edges.push({ from: lastNode, to: "end" });
+
+  return { 
+    nodes, 
+    edges,
+    summary: markdown // Store the original summary
+  };
 };
